@@ -1,4 +1,4 @@
-# server.py (hardened + ASR stats/finals + connect logs + auto-greeting + strong health + explicit model)
+# server.py (gapless early-playback: PCM->WAV, debounce, coalescing, sanitization)
 import os
 import json
 import asyncio
@@ -14,6 +14,11 @@ import uvicorn
 import aiohttp
 from aiohttp import ClientSession, WSMsgType, ClientResponseError, ClientTimeout
 from dotenv import load_dotenv
+
+# NEW: for WAV wrapping + text sanitize
+import io, wave, re
+
+from system_prompt import system_prompt as SYSTEM_PROMPT
 
 load_dotenv()
 logger = logging.getLogger("server")
@@ -34,8 +39,16 @@ ASR_ENDPOINTING_MS = int(os.getenv("ASR_ENDPOINTING_MS", "500"))
 TTS_QUEUE_MAX = int(os.getenv("TTS_QUEUE_MAX", "12"))                # sentences
 TTS_SENTENCE_MAX_CHARS = int(os.getenv("TTS_SENTENCE_MAX_CHARS", "280"))
 
+# ---- New audio constants for WAV wrapper ----
+SAMPLE_RATE = 22050       # matches pcm_22050
+CHANNELS = 1
+SAMPLE_WIDTH = 2          # 16-bit LE PCM
+
+# ---- Debounce to smooth starts (ms) ----
+DEBOUNCE_MS = 120
+
 # Auto-greeting toggle (bot speaks first on connect)
-AUTO_GREETING = os.getenv("AUTO_GREETING", "true").lower() in ("1", "true", "yes")
+# AUTO_GREETING = os.getenv("AUTO_GREETING", "true").lower() in ("1", "true", "yes")
 
 REQUIRED_ENV = {
     "DG_API_KEY": DG_API_KEY,
@@ -82,7 +95,7 @@ async def health():
         "missing": getattr(app.state, "missing_env", []),
     })
 
-# ----- Utilities -----
+# ----- Text utilities -----
 END_PUNCT = ("!", "?", ".", "।")
 def jd(x) -> str: return json.dumps(x, ensure_ascii=False, separators=(",", ":"))
 
@@ -109,9 +122,43 @@ def _segment_sentences(buf: str) -> Tuple[List[str], str]:
             i += 1
     return out, buf
 
+# ---- NEW: coalescing to avoid tiny TTS fragments ----
+MIN_TTS_CHARS = 90      # tune 80–140
+MAX_TTS_CHARS = 260     # keep chunks reasonable
+
+def _coalesce_for_tts(q: Deque[str]) -> str:
+    buf = []
+    total = 0
+    while q and (total < MIN_TTS_CHARS or (total < MAX_TTS_CHARS and len(q) >= 1)):
+        s = q.popleft().strip()
+        if not s:
+            continue
+        buf.append(s)
+        total += len(s) + 1
+    return " ".join(buf).strip()
+
 def _cap_sentence(s: str) -> str:
     s = s.strip()
     return s if len(s) <= TTS_SENTENCE_MAX_CHARS else s[:TTS_SENTENCE_MAX_CHARS] + "…"
+
+# ---- NEW: sanitize Hinglish/punctuation to reduce "ehhh/ohhh" ----
+def sanitize_for_tts(s: str) -> str:
+    s = re.sub(r"\s*\.\.\.\s*", ", ", s)          # replace ...
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # light Hinglish stabilization
+    s = s.replace(" ji", " jee").replace("Ji", "Jee")
+    s = s.replace("haan", "haan,")
+    return s
+
+# ---- NEW: wrap raw PCM into a WAV container for gapless browser playback ----
+def pcm_to_wav_bytes(pcm_bytes: bytes) -> bytes:
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPLE_WIDTH)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm_bytes)
+    return bio.getvalue()
 
 # ----- WebSocket endpoint -----
 @app.websocket("/ws")
@@ -142,14 +189,21 @@ async def socket_endpoint(client_ws: WebSocket):
     tts_task: Optional[asyncio.Task] = None
     gen_id = 0  # increments on each barge-in to invalidate old TTS
 
+    # NEW: debounce task handle
+    debounce_task: Optional[asyncio.Task] = None
+
     # ASR debug counters/tasks
     bytes_up = 0
     stats_task: Optional[asyncio.Task] = None
 
     # --- helpers
     async def cleanup():
-        nonlocal session, dg_ws, oai_ws, tts_task, stats_task
+        nonlocal session, dg_ws, oai_ws, tts_task, stats_task, debounce_task
         logger.info("Cleaning up connection")
+        with suppress(Exception):
+            if debounce_task and not debounce_task.done():
+                debounce_task.cancel()
+                await asyncio.gather(debounce_task, return_exceptions=True)
         with suppress(Exception):
             if stats_task and not stats_task.done():
                 stats_task.cancel()
@@ -183,47 +237,6 @@ async def socket_endpoint(client_ws: WebSocket):
             pass
         except Exception as e:
             logger.debug(f"stats publisher stopped: {e}")
-
-    # async def connect_deepgram(session: ClientSession):
-    #     params_primary = {
-    #         "model": "nova-3",
-    #         "encoding": "opus",
-    #         "sample_rate": "48000",
-    #         "channels": "1",
-    #         "smart_format": "true",
-    #         "interim_results": "true",
-    #         "endpointing": str(ASR_ENDPOINTING_MS),
-    #     }
-    #     if ASR_LANGUAGE_HINT:
-    #         params_primary["language"] = ASR_LANGUAGE_HINT  # e.g., "multi"|"en"|"hi"
-
-    #     params_minimal = {"model": "nova-3", "encoding": "opus", "sample_rate": "48000", "channels": "1"}
-
-    #     async def _connect(params: dict):
-    #         qs = "&".join(f"{k}={v}" for k, v in params.items())
-    #         url = f"wss://api.deepgram.com/v1/listen?{qs}"
-    #         return await session.ws_connect(
-    #             url,
-    #             headers={"Authorization": f"Token {DG_API_KEY}"},
-    #             heartbeat=30,
-    #             autoping=True,
-    #         )
-
-    #     try:
-    #         return await _connect(params_primary)
-    #     except ClientResponseError as cre:
-    #         logger.warning(f"[Deepgram] handshake {cre.status}: {cre.message}")
-    #         if cre.status == 400:
-    #             try:
-    #                 logger.info("[Deepgram] retry minimal params")
-    #                 return await _connect(params_minimal)
-    #             except Exception as e2:
-    #                 logger.error(f"[Deepgram] minimal connect failed: {e2}")
-    #                 raise
-    #         raise
-    #     except Exception as e:
-    #         logger.error(f"[Deepgram] connect error: {e}")
-    #         raise
 
     async def connect_deepgram(session: ClientSession):
         # A) Let Deepgram auto-detect container/codec (often best for MediaRecorder webm/opus)
@@ -271,39 +284,40 @@ async def socket_endpoint(client_ws: WebSocket):
                 return ws
             except ClientResponseError as cre:
                 logger.warning(f"[Deepgram] handshake ({label}) {cre.status}: {cre.message}")
-                # continue to next profile
             except Exception as e:
                 logger.warning(f"[Deepgram] connect error ({label}): {e}")
-                # continue to next profile
 
         # If all failed, raise last error
         raise RuntimeError("Failed to connect to Deepgram with all profiles")
-
 
     async def connect_openai(session: ClientSession):
         url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
         ws = await session.ws_connect(
             url,
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1",          # <-- REQUIRED
+            },
             heartbeat=30,
             autoping=True,
         )
         await ws.send_str(jd({
             "type": "session.update",
             "session": {
-                "type": "realtime",
-                "instructions": (
-                    "You are a friendly, empathetic voice assistant for India. "
-                    "Reply in the user’s language (Hindi/English/Hinglish), 1–2 sentences, TTS-friendly."
-                )
+                "instructions": SYSTEM_PROMPT,
+                # "turn_detection": {"type": "none"}
             }
         }))
         return ws
 
     async def handle_barge_in():
         """Cancel current TTS & response; clear queue; notify client."""
-        nonlocal tts_task, speaking, llm_buf, tts_queue, oai_ws, gen_id
+        nonlocal tts_task, speaking, llm_buf, tts_queue, oai_ws, gen_id, debounce_task
         gen_id += 1  # invalidate in-flight TTS
+        if debounce_task and not debounce_task.done():
+            debounce_task.cancel()
+            with suppress(Exception):
+                await asyncio.gather(debounce_task, return_exceptions=True)
         if tts_task and not tts_task.done():
             tts_task.cancel()
             with suppress(Exception):
@@ -316,13 +330,20 @@ async def socket_endpoint(client_ws: WebSocket):
             if oai_ws and not oai_ws.closed:
                 await oai_ws.send_str(jd({"type": "response.cancel"}))
 
+    # ---- TTS: PCM output (gapless), mild latency profile ----
     async def tts_chunk(text: str) -> bytes:
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
-        params = {"optimize_streaming_latency": "3", "output_format": "mp3_22050_32"}
+        params = {"optimize_streaming_latency": "1", "output_format": "pcm_22050"}
         body = {
             "text": text,
+            # "model_id": "eleven_turbo_v2_5",  # if you have access
             "model_id": "eleven_multilingual_v2",
-            "voice_settings": {"stability": 0.35, "similarity_boost": 0.9, "style": 0.65, "use_speaker_boost": True}
+            "voice_settings": {
+                "stability": 1.0,
+                "similarity_boost": 0.8,
+                "style": 0.15,
+                "use_speaker_boost": False
+            }
         }
         # bounded retries for transient errors
         attempts = 0
@@ -335,9 +356,8 @@ async def socket_endpoint(client_ws: WebSocket):
                 ) as resp:
                     resp.raise_for_status()
                     bufs = [chunk async for chunk in resp.content.iter_chunked(4096)]
-                    return b"".join(bufs)
+                    return b"".join(bufs)  # raw PCM 16-bit LE at 22.05kHz mono
             except ClientResponseError as cre:
-                # 4xx: don't retry except maybe 429
                 if cre.status == 429 and attempts < 3:
                     await asyncio.sleep(0.4 * attempts)
                     continue
@@ -347,6 +367,20 @@ async def socket_endpoint(client_ws: WebSocket):
                     await asyncio.sleep(0.4 * attempts)
                     continue
                 raise
+
+    # ---- NEW: Debounced drain to wait for a few more tokens from LLM ----
+    async def schedule_drain():
+        nonlocal debounce_task
+        if debounce_task and not debounce_task.done():
+            debounce_task.cancel()
+            with suppress(Exception):
+                await asyncio.gather(debounce_task, return_exceptions=True)
+
+        async def _later():
+            await asyncio.sleep(DEBOUNCE_MS / 1000.0)
+            await drain_tts(gen_id)
+
+        debounce_task = asyncio.create_task(_later())
 
     async def drain_tts(current_gen: int):
         nonlocal speaking, tts_task
@@ -358,22 +392,33 @@ async def socket_endpoint(client_ws: WebSocket):
             speaking = True
             try:
                 while tts_queue:
-                    # If barge-in happened, abort
                     if my_gen != gen_id:
                         return
-                    text = _cap_sentence(tts_queue.popleft())
+                    # Coalesce multiple sentences to avoid micro-fragments
+                    text = _coalesce_for_tts(tts_queue)
+                    if not text:
+                        return
+                    text = sanitize_for_tts(text)
+
                     try:
-                        audio = await tts_chunk(text)
+                        pcm = await tts_chunk(text)
+                        wav = pcm_to_wav_bytes(pcm)  # wrap for browser-friendly, gapless chunks
                     except Exception as e:
                         await ws_send_json(client_ws, {
                             "type": "error", "source": "tts", "code": "ELEVENLABS_FAILED",
                             "message": "TTS request failed", "details": str(e)[:200]
                         })
                         return
-                    # If client closed during TTS
+
                     try:
-                        await client_ws.send_bytes(audio)
-                        await ws_send_json(client_ws, {"type": "bot.audio.chunk", "bytes": len(audio)})
+                        await client_ws.send_bytes(wav)
+                        await ws_send_json(client_ws, {
+                            "type": "bot.audio.chunk",
+                            "bytes": len(wav),
+                            "format": "audio/wav",   # tell client what it is
+                            "sr": SAMPLE_RATE,
+                            "channels": CHANNELS
+                        })
                     except Exception as e:
                         logger.info(f"Client send_bytes failed (likely closed): {e}")
                         return
@@ -421,7 +466,6 @@ async def socket_endpoint(client_ws: WebSocket):
                     et = evt.get("type")  # e.g., "Results", "Error", "Warning", "Metadata"
                     logger.info(f"[Deepgram] event type: {et}")
 
-                    # Handle explicit DG errors/warnings
                     if et in ("Error", "error"):
                         msg = evt.get("message") or evt
                         logger.error(f"[Deepgram] ERROR: {msg}")
@@ -432,15 +476,12 @@ async def socket_endpoint(client_ws: WebSocket):
                         msg = evt.get("message") or evt
                         logger.warning(f"[Deepgram] WARNING: {msg}")
                         await ws_send_json(client_ws, {"type": "warn", "code": "DEEPGRAM_WARNING", "message": str(msg)[:300]})
-                        # keep going
 
-                    # Normal transcript path (Deepgram "Results" shape)
                     ch = (evt.get("channel") or {})
                     alt0 = (ch.get("alternatives") or [{}])[0]
                     transcript = alt0.get("transcript") or ""
                     is_final = bool(evt.get("is_final") or evt.get("speech_final") or False)
 
-                    # Show unknown-but-informative events in console (helps confirm DG is alive)
                     if not transcript and et not in ("Results", None):
                         await ws_send_json(client_ws, {"type": "asr.event", "eventType": et})
                         continue
@@ -455,17 +496,23 @@ async def socket_endpoint(client_ws: WebSocket):
                         if speaking:
                             await handle_barge_in()
                         llm_buf = ""
-                        
-                        # TEMP ECHO MODE: speak back what user said
-                        tts_queue.append(transcript)
-                        await drain_tts(gen_id)
-                        
-                        # Normal mode: send to OpenAI for response
-                        # with suppress(Exception):
-                        #     await oai_ws.send_str(jd({
-                        #         "type": "response.create",
-                        #         "response": {"instructions": transcript}
-                        #     }))
+
+                        # Send to OpenAI
+                        with suppress(Exception):
+                            await oai_ws.send_str(jd({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "input_text", "text": transcript}
+                                    ]
+                                }
+                            }))
+                            await oai_ws.send_str(jd({
+                                "type": "response.create",
+                                "response": { "modalities": ["text"] }
+                            }))
 
                 elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
                     break
@@ -473,7 +520,6 @@ async def socket_endpoint(client_ws: WebSocket):
             logger.warning(f"Deepgram reader error: {e}")
             await ws_send_json(client_ws, {"type": "error", "source": "asr", "code": "ASR_STREAM_FAILED",
                                         "message": "ASR stream ended unexpectedly"})
-
 
     async def read_openai():
         nonlocal llm_buf
@@ -483,24 +529,41 @@ async def socket_endpoint(client_ws: WebSocket):
                     try:
                         evt = json.loads(m.data)
                     except Exception as e:
-                        logger.warning(f"OpenAI parse error: {e}")
+                        logger.warning(f"OpenAI parse error: {e}; raw={m.data[:200]}")
                         continue
 
-                    et = evt.get("type")
-                    if et in ("response.text.delta", "response.output_text.delta"):
+                    et = evt.get("type") or ""
+
+                    # Unified text-delta handling
+                    if et in ("response.output_text.delta", "response.text.delta"):
                         delta = evt.get("delta") or ""
                         await ws_send_json(client_ws, {"type": "bot.text.delta", "delta": delta})
-                        # segment & enqueue into TTS
                         segs, llm_buf = _segment_sentences(llm_buf + delta)
                         for s in segs:
                             if len(tts_queue) >= TTS_QUEUE_MAX:
                                 tts_queue.popleft()
                                 await ws_send_json(client_ws, {"type": "warn", "code": "TTS_QUEUE_OVERFLOW"})
                             tts_queue.append(s)
-                        await drain_tts(gen_id)
+                        # CHANGED: debounce instead of immediate drain
+                        await schedule_drain()
                         continue
 
-                    if et in ("response.text.done", "response.done", "response.completed"):
+                    if et == "response.delta":
+                        d = evt.get("delta") or {}
+                        delta = d.get("output_text") or d.get("text") or ""
+                        if delta:
+                            await ws_send_json(client_ws, {"type": "bot.text.delta", "delta": delta})
+                            segs, llm_buf = _segment_sentences(llm_buf + delta)
+                            for s in segs:
+                                if len(tts_queue) >= TTS_QUEUE_MAX:
+                                    tts_queue.popleft()
+                                    await ws_send_json(client_ws, {"type": "warn", "code": "TTS_QUEUE_OVERFLOW"})
+                                tts_queue.append(s)
+                            # CHANGED: debounce
+                            await schedule_drain()
+                            continue
+
+                    if et in ("response.output_text.done", "response.text.done", "response.done", "response.completed"):
                         tail = llm_buf.strip()
                         if tail:
                             if len(tts_queue) >= TTS_QUEUE_MAX:
@@ -508,14 +571,20 @@ async def socket_endpoint(client_ws: WebSocket):
                                 await ws_send_json(client_ws, {"type": "warn", "code": "TTS_QUEUE_OVERFLOW"})
                             tts_queue.append(tail)
                             llm_buf = ""
+                        # End of turn → still use drain (no debounce needed, but harmless)
                         await drain_tts(gen_id)
                         continue
 
                     if et == "error":
-                        await ws_send_json(client_ws, {"type": "error", "source": "openai", "code": "OPENAI_ERROR",
-                                                        "message": evt.get("error") or "OpenAI error"})
+                        err_obj = evt.get("error") or {}
+                        msg = err_obj.get("message") or err_obj or "OpenAI error"
+                        await ws_send_json(client_ws, {
+                            "type": "error", "source": "openai", "code": "OPENAI_ERROR", "message": str(msg)[:500]
+                        })
+                        logger.error(f"[OpenAI] error event: {evt}")
                     else:
-                        logger.debug(f"OpenAI event passthrough: {et}")
+                        logger.debug(f"OpenAI event passthrough: {et} -> {evt}")
+                        await ws_send_json(client_ws, {"type": "openai.event", "event": et})
                 elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
                     break
         except Exception as e:
@@ -550,17 +619,17 @@ async def socket_endpoint(client_ws: WebSocket):
         # Start ASR stats publisher
         stats_task = asyncio.create_task(publish_stats())
 
-        # OPTIONAL auto-greeting so the bot speaks first
-        if AUTO_GREETING:
-            try:
-                await oai_ws.send_str(jd({
-                    "type": "response.create",
-                    "response": {
-                        "instructions": "Namaste! Main madad kar sakti hoon—kaunsi gaadi ya variant dekh rahe ho? (Short answer please.)"
-                    }
-                }))
-            except Exception as e:
-                logger.warning(f"OpenAI greeting failed: {e}")
+        # OPTIONAL auto-greeting
+        # if AUTO_GREETING:
+        #     try:
+        #         await oai_ws.send_str(jd({
+        #             "type": "response.create",
+        #             "response": {
+        #                 "instructions": "Namaste! Main madad kar sakti hoon—kaunsi gaadi ya variant dekh rahe ho? (Short answer please.)"
+        #             }
+        #         }))
+        #     except Exception as e:
+        #         logger.warning(f"OpenAI greeting failed: {e}")
 
         tasks = [
             asyncio.create_task(read_client()),
