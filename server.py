@@ -228,10 +228,14 @@ async def enablex_stream(ws: WebSocket):
     # --- Deepgram connect (8k μ-law telephony) ---
     dg_params = {
         "model": "nova-3",
-        "punctuate": "true",
+        "encoding": "mulaw",
+        "sample_rate": "8000",
+        "channels": "1",
         "interim_results": "true",
         "smart_format": "true",
-        # we still send these in Settings, but query works too
+        "endpointing": str(ASR_ENDPOINTING_MS),
+        # Optionally add "language": "en" or "hi" if you really need a fixed language.
+        # Avoid "multi" unless your DG account/docs confirm it for nova-3 Listen.
     }
     qs = "&".join(f"{k}={v}" for k, v in dg_params.items())
     dg_url = f"wss://api.deepgram.com/v1/listen?{qs}"
@@ -255,17 +259,17 @@ async def enablex_stream(ws: WebSocket):
                 return
 
             # --- Send explicit Settings FIRST (prevents early close) ---
-            cfg = {
-                "type": "Configure",
-                "audio": { "encoding": "mulaw", "sample_rate": 8000, "channels": 1 },
-                "model": "nova-3",
-                "interim_results": True,
-                "smart_format": True,
-                "endpointing": ASR_ENDPOINTING_MS,
-            }
-            if ASR_LANGUAGE_HINT:
-                cfg["language"] = ASR_LANGUAGE_HINT
-            await dg.send_str(json.dumps(cfg))
+            # cfg = {
+            #     "type": "Configure",
+            #     "audio": { "encoding": "mulaw", "sample_rate": 8000, "channels": 1 },
+            #     "model": "nova-3",
+            #     "interim_results": True,
+            #     "smart_format": True,
+            #     "endpointing": ASR_ENDPOINTING_MS,
+            # }
+            # if ASR_LANGUAGE_HINT:
+            #     cfg["language"] = ASR_LANGUAGE_HINT
+            # await dg.send_str(json.dumps(cfg))
 
             dg_closing = False  # flip to True when DG begins closing
 
