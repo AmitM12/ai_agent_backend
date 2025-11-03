@@ -30,6 +30,13 @@ logger = logging.getLogger("server")
 PORT = int(os.getenv("PORT", "3001"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g., https://your-app.onrender.com
 
+# Echo mode (bypass LLM and speak back user's words)
+ECHO_MODE = (os.getenv("ECHO_MODE", "false").lower() in ("1","true","yes"))
+# If True, don't split the echoed text into sentences—play exactly what user said
+ECHO_STRICT_NO_SPLIT = (os.getenv("ECHO_STRICT_NO_SPLIT", "true").lower() in ("1","true","yes"))
+# Optional: echo interims too (usually NO, gets choppy)
+ECHO_INTERIMS = (os.getenv("ECHO_INTERIMS", "false").lower() in ("1","true","yes"))
+
 # OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
@@ -121,14 +128,22 @@ async def ensure_session(voice_id: str) -> CallSession:
 @app.get("/health")
 async def health():
     missing = []
-    for k in ["PUBLIC_BASE_URL", "OPENAI_API_KEY", "DG_API_KEY", "ENABLEX_APP_ID", "ENABLEX_APP_KEY"]:
+    # Always require these:
+    for k in ["PUBLIC_BASE_URL", "DG_API_KEY", "ENABLEX_APP_ID", "ENABLEX_APP_KEY"]:
         if not globals().get(k):
             missing.append(k)
+
+    # Only require OpenAI when NOT in echo mode
+    if not ECHO_MODE and not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+
+    # ElevenLabs only if you chose that path
     if USE_ELEVENLABS_TTS:
         for k in ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"]:
             if not globals().get(k):
                 missing.append(k)
-    return JSONResponse({"ok": len(missing) == 0, "missing": missing})
+
+    return JSONResponse({"ok": len(missing) == 0, "echo_mode": ECHO_MODE, "missing": missing})
 
 # -----------------------------
 # Serve synthesized MP3s from memory via a stable URL
@@ -324,24 +339,31 @@ async def enablex_stream(ws: WebSocket):
         await asyncio.gather(pump_enx_to_dg(), pump_dg_to_bot())
 
 # -----------------------------
-# Core bot logic: LLM → TTS → EnableX play
+# Core bot logic: Echo or LLM → TTS → EnableX play
 # -----------------------------
 async def handle_final_text(session: CallSession, user_text: str):
-    """Handle a finalized user utterance: call LLM, speak back via EnableX."""
-    logger.info(f"[BOT] handle_final_text: {user_text}")
+    """Handle a finalized user utterance: echo it OR call LLM, then speak via EnableX."""
+    logger.info(f"[BOT] handle_final_text (echo_mode={ECHO_MODE}): {user_text}")
 
-    # 1) LLM reply (short, sentence-level)
-    reply_text = await llm_reply(user_text)
+    # 1) Choose reply
+    if ECHO_MODE:
+        reply_text = user_text  # exact echo
+    else:
+        reply_text = await llm_reply(user_text)
 
-    # 2) Sentence chunking for early-start playback
-    segs, tail = _segment_sentences(reply_text)
-    if tail.strip():
-        segs.append(tail.strip())
+    # 2) Chunking
+    if ECHO_MODE and ECHO_STRICT_NO_SPLIT:
+        segs = [reply_text]  # play exactly what user said (no segmentation/truncation)
+    else:
+        segs, tail = _segment_sentences(reply_text)
+        if tail.strip():
+            segs.append(tail.strip())
 
-    # 3) Enqueue & start playback
+    # 3) Enqueue & play
     for s in segs:
-        if len(s) > TTS_SENTENCE_MAX_CHARS:
-            s = s[:TTS_SENTENCE_MAX_CHARS] + "…"
+        if not (ECHO_MODE and ECHO_STRICT_NO_SPLIT):
+            if len(s) > TTS_SENTENCE_MAX_CHARS:
+                s = s[:TTS_SENTENCE_MAX_CHARS] + "…"
         await play_sentence(session, s)
 
 async def _openai_with_retries(url: str, body: dict, headers: dict, attempts: int = 3) -> dict:
