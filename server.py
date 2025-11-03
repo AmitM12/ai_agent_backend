@@ -223,76 +223,149 @@ async def enablex_stream(ws: WebSocket):
 
     logger.info(f"[ENX WS] connected path={ws.url.path} voice_id={voice_id or 'unknown'}")
 
-    # ... Deepgram connect code is unchanged ...
+    # --- Deepgram connect (8k μ-law telephony) ---
+    dg_params = {
+        "model": "nova-3",
+        "encoding": "mulaw",
+        "sample_rate": "8000",
+        "channels": "1",
+        "smart_format": "true",
+        "interim_results": "true",
+        "endpointing": str(ASR_ENDPOINTING_MS),
+    }
+    if ASR_LANGUAGE_HINT:
+        dg_params["language"] = ASR_LANGUAGE_HINT
 
-    async def pump_enx_to_dg():
-        nonlocal session, voice_id
-        try:
-            while True:
-                ev = await ws.receive()
-                if ev.get("type") == "websocket.disconnect":
-                    break
+    qs = "&".join(f"{k}={v}" for k, v in dg_params.items())
+    dg_url = f"wss://api.deepgram.com/v1/listen?{qs}"
 
-                if ev.get("text") is not None:
-                    try:
-                        obj = json.loads(ev["text"])
-                    except Exception:
-                        continue
+    timeout = ClientTimeout(total=0, sock_connect=20, sock_read=120)
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers={"Authorization": f"Token {DG_API_KEY}"}
+        ) as http:
+            try:
+                dg = await http.ws_connect(dg_url, heartbeat=30, autoping=True)
+                logger.info(f"[DG] connected: {dg_url}")
+            except Exception:
+                logger.exception("[DG] connect failed")
+                # Close ENX socket so upstream retries / alarms fire
+                with suppress(Exception):
+                    await ws.close(code=1011)
+                return
 
-                    # Bind on first JSON if needed:
-                    call_id = obj.get("voice_id") or obj.get("callId") or obj.get("id")
-                    if call_id and not session:
-                        voice_id = call_id
-                        session = await ensure_session(voice_id)
-                        logger.info(f"[ENX WS] bound voice_id from JSON: {voice_id}")
+            async def pump_enx_to_dg():
+                nonlocal session, voice_id
+                total_bytes = 0
+                try:
+                    while True:
+                        ev = await ws.receive()
 
-                    st = (obj.get("state") or "").lower()
-                    if st == "start_media":
-                        logger.info("[ENX] start_media received")
-                        continue
+                        if ev.get("type") == "websocket.disconnect":
+                            logger.info("[ENX WS] disconnect")
+                            break
 
-                    if st == "recognized" and obj.get("text"):
-                        if session and session.playing:
-                            with suppress(Exception):
-                                await enablex_stop_play(session.voice_id)
-                            session.playing = False
-                        if session:
-                            await handle_final_text(session, obj["text"])
-                        else:
-                            logger.warning("[ENX] recognized text but no voice_id bound yet; dropping")
-                        continue
+                        # ---- TEXT frames: control / start_media / recognized / optional b64 audio ----
+                        if ev.get("text") is not None:
+                            try:
+                                obj = json.loads(ev["text"])
+                            except Exception:
+                                logger.warning("[ENX->DG] non-JSON text ignored")
+                                continue
 
-                    # Optional JSON-embedded audio (base64 mulaw)
-                    payload_b64 = (
-                        obj.get("payload")
-                        or (obj.get("media") or {}).get("payload")
-                        or (obj.get("audio") or {}).get("data")
-                        or obj.get("data")
-                    )
-                    if payload_b64:
-                        try:
-                            audio_bytes = base64.b64decode(payload_b64)
-                            await dg.send_bytes(audio_bytes)
-                        except Exception as e:
-                            logger.warning(f"[ENX->DG] JSON payload decode failed: {e}")
-                    continue
+                            # Bind voice_id if present
+                            call_id = obj.get("voice_id") or obj.get("callId") or obj.get("id")
+                            if call_id and not session:
+                                voice_id = call_id
+                                session = await ensure_session(voice_id)
+                                logger.info(f"[ENX WS] bound voice_id from JSON: {voice_id}")
 
-                # Binary frames: 12B header + base64 μ-law payload
-                if ev.get("bytes") is not None:
-                    buf = ev["bytes"]
-                    payload = buf[12:] if len(buf) > 12 else buf
-                    try:
-                        ulaw_bytes = base64.b64decode(payload, validate=False)
-                    except Exception:
-                        ulaw_bytes = payload
-                    try:
-                        await dg.send_bytes(ulaw_bytes)
-                    except Exception as e:
-                        logger.warning(f"[ENX->DG] send to Deepgram failed: {e}")
-                    continue
-        finally:
-            with suppress(Exception):
-                await dg.close()
+                            st = (obj.get("state") or "").lower()
+                            if st == "start_media":
+                                logger.info("[ENX] start_media received")
+                                continue
+
+                            if st == "recognized" and obj.get("text"):
+                                if session and session.playing:
+                                    with suppress(Exception):
+                                        await enablex_stop_play(session.voice_id)
+                                    session.playing = False
+                                if session:
+                                    await handle_final_text(session, obj["text"])
+                                else:
+                                    logger.warning("[ENX] recognized text but no voice_id; dropping")
+                                continue
+
+                            payload_b64 = (
+                                obj.get("payload")
+                                or (obj.get("media") or {}).get("payload")
+                                or (obj.get("audio") or {}).get("data")
+                                or obj.get("data")
+                            )
+                            if payload_b64:
+                                try:
+                                    audio_bytes = base64.b64decode(payload_b64)
+                                    total_bytes += len(audio_bytes)
+                                    if total_bytes % 32768 < 1600:
+                                        logger.info(f"[ENX->DG] +{len(audio_bytes)}B (total {total_bytes}B)")
+                                    await dg.send_bytes(audio_bytes)
+                                except Exception as e:
+                                    logger.warning(f"[ENX->DG] JSON payload decode failed: {e}")
+                            continue
+
+                        # ---- BINARY frames: 12B header + base64 μ-law payload (EnableX format) ----
+                        if ev.get("bytes") is not None:
+                            buf = ev["bytes"]
+                            payload = buf[12:] if len(buf) > 12 else buf
+                            try:
+                                ulaw_bytes = base64.b64decode(payload, validate=False)
+                            except Exception:
+                                ulaw_bytes = payload
+                            total_bytes += len(ulaw_bytes)
+                            if total_bytes % 32768 < 1600:
+                                logger.info(f"[ENX->DG] +{len(ulaw_bytes)}B (total {total_bytes}B)")
+                            try:
+                                await dg.send_bytes(ulaw_bytes)
+                            except Exception as e:
+                                logger.warning(f"[ENX->DG] send to Deepgram failed: {e}")
+                            continue
+                finally:
+                    with suppress(Exception):
+                        await dg.close()
+
+            async def pump_dg_to_bot():
+                try:
+                    async for m in dg:
+                        if m.type == WSMsgType.TEXT:
+                            try:
+                                evt = json.loads(m.data)
+                            except Exception:
+                                continue
+                            if evt.get("type") == "Results":
+                                alt0 = (evt.get("channel", {}).get("alternatives") or [{}])[0]
+                                transcript = alt0.get("transcript") or ""
+                                is_final = bool(evt.get("is_final") or evt.get("speech_final"))
+                                if transcript:
+                                    logger.info(f"[ASR]{' (final)' if is_final else ''}: {transcript}")
+                                if transcript and is_final and session:
+                                    if session.playing:
+                                        with suppress(Exception):
+                                            await enablex_stop_play(session.voice_id)
+                                        session.playing = False
+                                    await handle_final_text(session, transcript)
+                        elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
+                            break
+                except Exception as e:
+                    logger.warning(f"[DG] reader error: {e}")
+
+            # IMPORTANT: actually start the pumps
+            await asyncio.gather(pump_enx_to_dg(), pump_dg_to_bot())
+
+    except Exception:
+        logger.exception("[ENX WS] handler crashed")
+        with suppress(Exception):
+            await ws.close(code=1011)
 
 @app.websocket("/ws")
 async def enablex_stream_alias(ws: WebSocket):
