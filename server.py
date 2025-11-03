@@ -255,21 +255,17 @@ async def enablex_stream(ws: WebSocket):
                 return
 
             # --- Send explicit Settings FIRST (prevents early close) ---
-            try:
-                await dg.send_json({
-                    "type": "Settings",
-                    "encoding": "mulaw",
-                    "sample_rate": 8000,
-                    "channels": 1,
-                    "interim_results": True,
-                    "smart_format": True,
-                })
-                logger.info("[DG] settings sent (mulaw@8000/1ch)")
-            except Exception:
-                logger.exception("[DG] failed to send Settings")
-                with suppress(Exception): await ws.close(code=1011)
-                with suppress(Exception): await dg.close()
-                return
+            cfg = {
+                "type": "Configure",
+                "audio": { "encoding": "mulaw", "sample_rate": 8000, "channels": 1 },
+                "model": "nova-3",
+                "interim_results": True,
+                "smart_format": True,
+                "endpointing": ASR_ENDPOINTING_MS,
+            }
+            if ASR_LANGUAGE_HINT:
+                cfg["language"] = ASR_LANGUAGE_HINT
+            await dg.send_str(json.dumps(cfg))
 
             dg_closing = False  # flip to True when DG begins closing
 
