@@ -210,6 +210,8 @@ async def enablex_webhook(req: Request):
 # -----------------------------
 # EnableX media stream WebSocket (caller audio -> Deepgram telephony)
 # -----------------------------
+from aiohttp import WSServerHandshakeError
+
 @app.websocket("/enablex/stream")
 async def enablex_stream(ws: WebSocket):
     await ws.accept()
@@ -226,16 +228,11 @@ async def enablex_stream(ws: WebSocket):
     # --- Deepgram connect (8k μ-law telephony) ---
     dg_params = {
         "model": "nova-3",
-        "encoding": "mulaw",
-        "sample_rate": "8000",
-        "channels": "1",
-        "smart_format": "true",
+        "punctuate": "true",
         "interim_results": "true",
-        "endpointing": str(ASR_ENDPOINTING_MS),
+        "smart_format": "true",
+        # we still send these in Settings, but query works too
     }
-    if ASR_LANGUAGE_HINT:
-        dg_params["language"] = ASR_LANGUAGE_HINT
-
     qs = "&".join(f"{k}={v}" for k, v in dg_params.items())
     dg_url = f"wss://api.deepgram.com/v1/listen?{qs}"
 
@@ -246,17 +243,38 @@ async def enablex_stream(ws: WebSocket):
             headers={"Authorization": f"Token {DG_API_KEY}"}
         ) as http:
             try:
-                dg = await http.ws_connect(dg_url, heartbeat=30, autoping=True)
+                dg = await http.ws_connect(dg_url, heartbeat=30, autoping=True, compress=0)
                 logger.info(f"[DG] connected: {dg_url}")
+            except WSServerHandshakeError as e:
+                logger.error(f"[DG] handshake failed {e.status} {e.message}")
+                with suppress(Exception): await ws.close(code=1011)
+                return
             except Exception:
                 logger.exception("[DG] connect failed")
-                # Close ENX socket so upstream retries / alarms fire
-                with suppress(Exception):
-                    await ws.close(code=1011)
+                with suppress(Exception): await ws.close(code=1011)
                 return
 
+            # --- Send explicit Settings FIRST (prevents early close) ---
+            try:
+                await dg.send_json({
+                    "type": "Settings",
+                    "encoding": "mulaw",
+                    "sample_rate": 8000,
+                    "channels": 1,
+                    "interim_results": True,
+                    "smart_format": True,
+                })
+                logger.info("[DG] settings sent (mulaw@8000/1ch)")
+            except Exception:
+                logger.exception("[DG] failed to send Settings")
+                with suppress(Exception): await ws.close(code=1011)
+                with suppress(Exception): await dg.close()
+                return
+
+            dg_closing = False  # flip to True when DG begins closing
+
             async def pump_enx_to_dg():
-                nonlocal session, voice_id
+                nonlocal session, voice_id, dg_closing
                 total_bytes = 0
                 try:
                     while True:
@@ -266,15 +284,14 @@ async def enablex_stream(ws: WebSocket):
                             logger.info("[ENX WS] disconnect")
                             break
 
-                        # ---- TEXT frames: control / start_media / recognized / optional b64 audio ----
                         if ev.get("text") is not None:
+                            # control/recognized/optional b64 audio
                             try:
                                 obj = json.loads(ev["text"])
                             except Exception:
                                 logger.warning("[ENX->DG] non-JSON text ignored")
                                 continue
 
-                            # Bind voice_id if present
                             call_id = obj.get("voice_id") or obj.get("callId") or obj.get("id")
                             if call_id and not session:
                                 voice_id = call_id
@@ -305,6 +322,8 @@ async def enablex_stream(ws: WebSocket):
                             )
                             if payload_b64:
                                 try:
+                                    if dg_closing:
+                                        continue
                                     audio_bytes = base64.b64decode(payload_b64)
                                     total_bytes += len(audio_bytes)
                                     if total_bytes % 32768 < 1600:
@@ -314,8 +333,10 @@ async def enablex_stream(ws: WebSocket):
                                     logger.warning(f"[ENX->DG] JSON payload decode failed: {e}")
                             continue
 
-                        # ---- BINARY frames: 12B header + base64 μ-law payload (EnableX format) ----
                         if ev.get("bytes") is not None:
+                            if dg_closing:
+                                continue
+                            # Binary frames: 12B header + base64 μ-law payload
                             buf = ev["bytes"]
                             payload = buf[12:] if len(buf) > 12 else buf
                             try:
@@ -335,6 +356,7 @@ async def enablex_stream(ws: WebSocket):
                         await dg.close()
 
             async def pump_dg_to_bot():
+                nonlocal dg_closing
                 try:
                     async for m in dg:
                         if m.type == WSMsgType.TEXT:
@@ -342,7 +364,14 @@ async def enablex_stream(ws: WebSocket):
                                 evt = json.loads(m.data)
                             except Exception:
                                 continue
-                            if evt.get("type") == "Results":
+
+                            # Log server-side issues early
+                            t = evt.get("type")
+                            if t in ("Warning", "Error"):
+                                logger.warning(f"[DG] {t}: {evt}")
+                            if t == "Metadata":
+                                logger.info(f"[DG] metadata: {evt.get('request_id')}")
+                            if t == "Results":
                                 alt0 = (evt.get("channel", {}).get("alternatives") or [{}])[0]
                                 transcript = alt0.get("transcript") or ""
                                 is_final = bool(evt.get("is_final") or evt.get("speech_final"))
@@ -350,16 +379,22 @@ async def enablex_stream(ws: WebSocket):
                                     logger.info(f"[ASR]{' (final)' if is_final else ''}: {transcript}")
                                 if transcript and is_final and session:
                                     if session.playing:
-                                        with suppress(Exception):
-                                            await enablex_stop_play(session.voice_id)
+                                        with suppress(Exception): await enablex_stop_play(session.voice_id)
                                         session.playing = False
                                     await handle_final_text(session, transcript)
+
                         elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
+                            dg_closing = True
+                            # Surface close code/reason if available
+                            try:
+                                logger.warning(f"[DG] closing: code={dg.close_code} reason={getattr(dg, 'close_message', None)}")
+                            except Exception:
+                                logger.warning("[DG] closing")
                             break
                 except Exception as e:
+                    dg_closing = True
                     logger.warning(f"[DG] reader error: {e}")
 
-            # IMPORTANT: actually start the pumps
             await asyncio.gather(pump_enx_to_dg(), pump_dg_to_bot())
 
     except Exception:
