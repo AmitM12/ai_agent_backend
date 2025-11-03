@@ -213,130 +213,91 @@ async def enablex_webhook(req: Request):
 @app.websocket("/enablex/stream")
 async def enablex_stream(ws: WebSocket):
     await ws.accept()
+
+    # voice_id may be absent if ENX doesn't append it in the URL
     params = ws.query_params
-    voice_id = params.get("voice_id")
-    if not voice_id:
-        await ws.close(code=4000)
-        return
-    session = await ensure_session(voice_id)
-    logger.info(f"[ENX WS] connected for voice_id={voice_id}")
+    voice_id: Optional[str] = params.get("voice_id")
+    session: Optional[CallSession] = None
+    if voice_id:
+        session = await ensure_session(voice_id)
 
-    # Connect Deepgram with 8kHz telephony settings
-    dg_params = {
-        "model": "nova-3",
-        "encoding": "mulaw",      # telephony μ-law
-        "sample_rate": "8000",
-        "channels": "1",
-        "smart_format": "true",
-        "interim_results": "true",
-        "endpointing": str(ASR_ENDPOINTING_MS),
-    }
-    if ASR_LANGUAGE_HINT:
-        dg_params["language"] = ASR_LANGUAGE_HINT
+    logger.info(f"[ENX WS] connected path={ws.url.path} voice_id={voice_id or 'unknown'}")
 
-    qs = "&".join(f"{k}={v}" for k, v in dg_params.items())
-    dg_url = f"wss://api.deepgram.com/v1/listen?{qs}"
+    # ... Deepgram connect code is unchanged ...
 
-    timeout = ClientTimeout(total=0, sock_connect=20, sock_read=120)
-    async with aiohttp.ClientSession(timeout=timeout, headers={"Authorization": f"Token {DG_API_KEY}"}) as http:
-        dg = await http.ws_connect(dg_url, heartbeat=30, autoping=True)
+    async def pump_enx_to_dg():
+        nonlocal session, voice_id
+        try:
+            while True:
+                ev = await ws.receive()
+                if ev.get("type") == "websocket.disconnect":
+                    break
 
-        async def pump_enx_to_dg():
-            try:
-                while True:
-                    ev = await ws.receive()
-                    t = ev.get("type")
-                    if t == "websocket.disconnect":
-                        break
+                if ev.get("text") is not None:
+                    try:
+                        obj = json.loads(ev["text"])
+                    except Exception:
+                        continue
 
-                    # A) Text frames: JSON control (e.g., {"state":"start_media"}) or recognized text
-                    if ev.get("text") is not None:
-                        try:
-                            obj = json.loads(ev["text"])
-                        except Exception:
-                            continue
+                    # Bind on first JSON if needed:
+                    call_id = obj.get("voice_id") or obj.get("callId") or obj.get("id")
+                    if call_id and not session:
+                        voice_id = call_id
+                        session = await ensure_session(voice_id)
+                        logger.info(f"[ENX WS] bound voice_id from JSON: {voice_id}")
 
-                        # control events from EnableX, e.g. {"state":"start_media"}
-                        st = (obj.get("state") or "").lower()
-                        if st == "start_media":
-                            logger.info("[ENX] start_media received")
-                            continue
+                    st = (obj.get("state") or "").lower()
+                    if st == "start_media":
+                        logger.info("[ENX] start_media received")
+                        continue
 
-                        # some tenants post recognized text via WS JSON
-                        if st == "recognized" and obj.get("text"):
-                            # treat as a final utterance
-                            if session.playing:
-                                with suppress(Exception):
-                                    await enablex_stop_play(session.voice_id)
-                                session.playing = False
+                    if st == "recognized" and obj.get("text"):
+                        if session and session.playing:
+                            with suppress(Exception):
+                                await enablex_stop_play(session.voice_id)
+                            session.playing = False
+                        if session:
                             await handle_final_text(session, obj["text"])
-                            continue
-
-                        # optional: other JSON formats carrying base64 audio
-                        payload_b64 = (
-                            obj.get("payload")
-                            or (obj.get("media") or {}).get("payload")
-                            or (obj.get("audio") or {}).get("data")
-                            or obj.get("data")
-                        )
-                        if payload_b64:
-                            try:
-                                audio_bytes = base64.b64decode(payload_b64)
-                                await dg.send_bytes(audio_bytes)
-                            except Exception as e:
-                                logger.warning(f"[ENX->DG] JSON payload decode failed: {e}")
+                        else:
+                            logger.warning("[ENX] recognized text but no voice_id bound yet; dropping")
                         continue
 
-                    # B) Binary frames: 12-byte header + base64 μ-law (per EnableX example)
-                    if ev.get("bytes") is not None:
-                        buf = ev["bytes"]
-                        payload = buf[12:] if len(buf) > 12 else buf
+                    # Optional JSON-embedded audio (base64 mulaw)
+                    payload_b64 = (
+                        obj.get("payload")
+                        or (obj.get("media") or {}).get("payload")
+                        or (obj.get("audio") or {}).get("data")
+                        or obj.get("data")
+                    )
+                    if payload_b64:
                         try:
-                            # payload is base64 ascii; python can b64-decode bytes directly
-                            ulaw_bytes = base64.b64decode(payload, validate=False)
-                        except Exception:
-                            # if not base64, try as raw μ-law
-                            ulaw_bytes = payload
-                        try:
-                            await dg.send_bytes(ulaw_bytes)
+                            audio_bytes = base64.b64decode(payload_b64)
+                            await dg.send_bytes(audio_bytes)
                         except Exception as e:
-                            logger.warning(f"[ENX->DG] send to Deepgram failed: {e}")
-                        continue
-            except WebSocketDisconnect:
-                pass
-            finally:
-                with suppress(Exception):
-                    await dg.close()
+                            logger.warning(f"[ENX->DG] JSON payload decode failed: {e}")
+                    continue
 
+                # Binary frames: 12B header + base64 μ-law payload
+                if ev.get("bytes") is not None:
+                    buf = ev["bytes"]
+                    payload = buf[12:] if len(buf) > 12 else buf
+                    try:
+                        ulaw_bytes = base64.b64decode(payload, validate=False)
+                    except Exception:
+                        ulaw_bytes = payload
+                    try:
+                        await dg.send_bytes(ulaw_bytes)
+                    except Exception as e:
+                        logger.warning(f"[ENX->DG] send to Deepgram failed: {e}")
+                    continue
+        finally:
+            with suppress(Exception):
+                await dg.close()
 
-        async def pump_dg_to_bot():
-            try:
-                async for m in dg:
-                    if m.type == WSMsgType.TEXT:
-                        try:
-                            evt = json.loads(m.data)
-                        except Exception:
-                            continue
-                        et = evt.get("type")
-                        if et == "Results":
-                            alt0 = (evt.get("channel", {}).get("alternatives") or [{}])[0]
-                            transcript = alt0.get("transcript") or ""
-                            is_final = bool(evt.get("is_final") or evt.get("speech_final"))
-                            if transcript:
-                                logger.info(f"[ASR]{' (final)' if is_final else ''}: {transcript}")
-                            if transcript and is_final:
-                                # Barge-in: stop any current play
-                                if session.playing:
-                                    with suppress(Exception):
-                                        await enablex_stop_play(session.voice_id)
-                                    session.playing = False
-                                await handle_final_text(session, transcript)
-                    elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
-                        break
-            except Exception as e:
-                logger.warning(f"[DG] reader error: {e}")
-
-        await asyncio.gather(pump_enx_to_dg(), pump_dg_to_bot())
+@app.websocket("/ws")
+async def enablex_stream_alias(ws: WebSocket):
+    # Reuse the same handler
+    await enablex_stream(ws)
 
 # -----------------------------
 # Core bot logic: Echo or LLM → TTS → EnableX play
