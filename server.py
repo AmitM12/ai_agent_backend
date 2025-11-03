@@ -549,6 +549,6 @@ async def root():
 if __name__ == "__main__":
     if not PUBLIC_BASE_URL:
         logger.warning("PUBLIC_BASE_URL is not set; remote playback via URL will fail.")
-    uvicorn.run("server_enablex:app", host="0.0.0.0", port=PORT, log_level=LOG_LEVEL.lower())
+    uvicorn.run("server:app", host="0.0.0.0", port=PORT, log_level=LOG_LEVEL.lower())
 
 # https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`;
