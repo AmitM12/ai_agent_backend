@@ -148,12 +148,14 @@ async def health():
 # -----------------------------
 # Serve synthesized MP3s from memory via a stable URL
 # -----------------------------
+from fastapi.responses import Response
+
 @app.get("/tts/{clip_id}.mp3")
 async def serve_tts(clip_id: str):
     data = AUDIO_STORE.get(clip_id)
     if not data:
         raise HTTPException(status_code=404, detail="Not found")
-    return StreamingResponse(iter([data]), media_type="audio/mpeg")
+    return Response(content=data, media_type="audio/mpeg")  # not StreamingResponse
 
 # -----------------------------
 # EnableX Webhook: call lifecycle & control
@@ -513,6 +515,7 @@ async def play_sentence(session: CallSession, text: str):
 
     if USE_ELEVENLABS_TTS:
         # Path B: synth with ElevenLabs -> serve via /tts/<id>.mp3 -> EnableX /play with URL
+        logger.info(f"[TTS] EL synth start: {text[:80]!r}")
         clip_id, url = await elevenlabs_synth_to_url(text)
         if my_gen != session.gen_id:
             return  # invalidated by barge-in
@@ -635,6 +638,7 @@ async def elevenlabs_synth_to_url(text: str) -> Tuple[str, str]:
                     AUDIO_STORE[clip_id] = mp3
                     base = PUBLIC_BASE_URL or f"http://localhost:{PORT}"
                     url = f"{base}/tts/{clip_id}.mp3"
+                    logger.info(f"[TTS] EL clip={clip_id} bytes={len(mp3)} url=/tts/{clip_id}.mp3")
                     return clip_id, url
         except ClientResponseError as cre:
             if cre.status == 429 and attempts < 3:
