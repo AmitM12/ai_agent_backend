@@ -83,6 +83,10 @@ class CallSession:
         self.speaking_task: Optional[asyncio.Task] = None
         self.oai_session: Optional[ClientSession] = None
         self.extra: Dict[str, str] = {}
+        # NEW: outbound (downlink) audio socket to ENX for TTS playback
+        self.down_http: Optional[aiohttp.ClientSession] = None
+        self.down_ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self.down_ready: bool = False   # flips True after we see {"state":"start_media"}
 
 SESSIONS: Dict[str, CallSession] = {}
 
@@ -169,12 +173,15 @@ async def enablex_webhook(req: Request):
     session = await ensure_session(voice_id)
 
     if state in ("answered", "connected", "live"):
-        # Start media stream
+        logger.info(f"[ENX ANSWERED] voice_id={voice_id} state={state}")
         wss_url = f"{PUBLIC_BASE_URL.replace('http','ws').replace('https','wss')}/enablex/stream?voice_id={voice_id}"
         await enablex_start_media_stream(voice_id, wss_url)
 
-        # Optional EL greeting (no built-in TTS)
+        # NEW: open outbound audio socket so we can push ULaw directly
+        asyncio.create_task(ensure_enx_downlink_socket(session))
+
         if AUTO_GREETING:
+            # Now use ElevenLabs stream → WS (no built-in TTS)
             with suppress(Exception):
                 await play_sentence(session, "Namaste! Kaise madad kar sakti hoon? Ek chhota sa sawaal puchiye.")
         return {"ok": True}
@@ -204,6 +211,94 @@ async def _dg_keepalive(ws, interval: int = 5):
             await ws.send_str('{"type":"KeepAlive"}')
     except Exception:
         pass
+
+# -----------------------------
+# Ensure ENX downlink socket for TTS playback
+# -----------------------------
+
+ENABLEX_AUDIO_WSS = os.getenv("ENABLEX_AUDIO_WSS", "wss://api.enablex.io:9090/audiosocket/socket.io/")
+
+async def ensure_enx_downlink_socket(session: CallSession):
+    # Reuse if alive
+    if session.down_ws and not session.down_ws.closed:
+        return
+    if session.down_http is None:
+        session.down_http = aiohttp.ClientSession()
+
+    headers = {
+        "X-App-ID": ENABLEX_APP_ID or "",
+        "X-App-Key": ENABLEX_APP_KEY or "",
+        "X-Voice-Id": session.voice_id,
+    }
+    try:
+        ws = await session.down_http.ws_connect(
+            ENABLEX_AUDIO_WSS, headers=headers, autoping=True, heartbeat=30, compress=0
+        )
+        session.down_ws = ws
+        session.down_ready = False
+        logger.info(f"[ENX DOWN] connected voice_id={session.voice_id}")
+
+        async def reader():
+            try:
+                async for m in ws:
+                    if m.type == WSMsgType.TEXT:
+                        try:
+                            evt = json.loads(m.data)
+                        except Exception:
+                            continue
+                        st = (evt.get("state") or "").lower()
+                        if st == "start_media":
+                            session.down_ready = True
+                            logger.info(f"[ENX DOWN] start_media for {session.voice_id} (ready to receive audio)")
+                    elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
+                        break
+            finally:
+                session.down_ready = False
+                logger.info(f"[ENX DOWN] closed voice_id={session.voice_id}")
+
+        asyncio.create_task(reader())
+
+    except Exception:
+        logger.exception("[ENX DOWN] connect failed")
+        session.down_ws = None
+        session.down_ready = False
+
+async def elevenlabs_stream_to_enx(text: str, session: CallSession):
+    await ensure_enx_downlink_socket(session)
+    if not (session.down_ws and not session.down_ws.closed):
+        logger.error("[ENX DOWN] socket not available; cannot stream TTS")
+        return
+
+    # Wait until ENX says start_media (ready to receive)
+    for _ in range(40):  # up to ~4s
+        if session.down_ready:
+            break
+        await asyncio.sleep(0.1)
+
+    api_url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
+    params = {"optimize_streaming_latency": "3", "output_format": "ulaw_8000"}
+    body = {
+        "text": text,
+        "model_id": ELEVENLABS_MODEL_ID,
+        "voice_settings": {"stability": 0.35, "similarity_boost": 0.9, "style": 0.65, "use_speaker_boost": True}
+    }
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+
+    # Stream smallish chunks (160 bytes ~20ms @8kHz mulaw) for smoother playout.
+    CHUNK = 160
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(api_url, params=params, json=body, headers=headers) as resp:
+                resp.raise_for_status()
+                async for chunk in resp.content.iter_chunked(CHUNK):
+                    if not chunk:
+                        continue
+                    # Push raw μ-law bytes into ENX downlink socket
+                    await session.down_ws.send_bytes(chunk)
+        logger.info(f"[TTS→ENX] streamed {len(text)} chars to voice_id={session.voice_id}")
+    except Exception:
+        logger.exception("[TTS→ENX] streaming failed")
+
 
 # -----------------------------
 # ENX media stream WS → Deepgram
@@ -452,15 +547,21 @@ async def llm_reply(user_text: str) -> str:
         return "Sorry, I’m having trouble right now—please try again."
 
 async def play_sentence(session: CallSession, text: str):
-    voice_id = session.voice_id
     session.gen_id += 1
     my_gen = session.gen_id
 
-    clip_id, url = await elevenlabs_synth_to_url(text)
-    if my_gen != session.gen_id:
-        return  # invalidated by barge-in
-    await enablex_play_url(voice_id, url)
-    session.playing = True
+    # Truncate long sentences a bit (optional)
+    if len(text) > TTS_SENTENCE_MAX_CHARS:
+        text = text[:TTS_SENTENCE_MAX_CHARS] + "…"
+
+    # If another utterance barges in, drop this one
+    before = my_gen
+
+    await elevenlabs_stream_to_enx(text, session)
+
+    # If something else started while we were streaming, treat as stopped
+    if before != session.gen_id:
+        return
 
 def enx_auth_headers() -> dict:
     return {
