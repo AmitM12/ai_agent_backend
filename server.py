@@ -207,6 +207,17 @@ async def enablex_webhook(req: Request):
             return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
     return {"ok": True}
 
+# --- Deepgram keepalive ping (prevents idle timeouts) ---
+async def _dg_keepalive(ws, interval: int = 5):
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            # Deepgram Listen WS understands {"type":"KeepAlive"}
+            await ws.send_str('{"type":"KeepAlive"}')
+    except Exception:
+        # socket closed or task canceled — safe to ignore
+        pass
+
 # -----------------------------
 # EnableX media stream WebSocket (caller audio -> Deepgram telephony)
 # -----------------------------
@@ -249,6 +260,7 @@ async def enablex_stream(ws: WebSocket):
             try:
                 dg = await http.ws_connect(dg_url, heartbeat=30, autoping=True, compress=0)
                 logger.info(f"[DG] connected: {dg_url}")
+                ka_task = asyncio.create_task(_dg_keepalive(dg))
             except WSServerHandshakeError as e:
                 logger.error(f"[DG] handshake failed {e.status} {e.message}")
                 with suppress(Exception): await ws.close(code=1011)
@@ -396,6 +408,8 @@ async def enablex_stream(ws: WebSocket):
                     logger.warning(f"[DG] reader error: {e}")
 
             await asyncio.gather(pump_enx_to_dg(), pump_dg_to_bot())
+            with suppress(Exception):
+                ka_task.cancel()
 
     except Exception:
         logger.exception("[ENX WS] handler crashed")
