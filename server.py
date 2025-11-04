@@ -227,34 +227,14 @@ from aiohttp import WSServerHandshakeError
 async def enablex_stream(ws: WebSocket):
     await ws.accept()
 
-    # voice_id may be absent if ENX doesn't append it in the URL (or when testing)
+    # voice_id may be absent if ENX doesn't append it in the URL
     params = ws.query_params
     voice_id: Optional[str] = params.get("voice_id")
+    session: Optional[CallSession] = None
+    if voice_id:
+        session = await ensure_session(voice_id)
 
-    # NEW: always have a session, even if no voice_id was provided
-    if not voice_id:
-        voice_id = f"dev-{uuid.uuid4().hex[:8]}"
-    session = await ensure_session(voice_id)
-
-    logger.info(f"[ENX WS] connected path={ws.url.path} voice_id={voice_id}")
-
-    # NEW: simple watchdog that complains if we never see audio
-    last_bytes = 0
-
-    async def _audio_watchdog():
-        nonlocal last_bytes
-        # checks every 3s, up to ~30s
-        for _ in range(10):
-            await asyncio.sleep(3)
-            if last_bytes == 0:
-                logger.warning("[ENX->DG] watchdog: no audio bytes seen yet (still waiting)")
-            else:
-                logger.info(f"[ENX->DG] watchdog: first audio received (total so far {last_bytes}B)")
-                return
-        logger.warning("[ENX->DG] watchdog: still no audio after 30s — check stream_dest/WS path")
-
-    asyncio.create_task(_audio_watchdog())
-
+    logger.info(f"[ENX WS] connected path={ws.url.path} voice_id={voice_id or 'unknown'}")
 
     # --- Deepgram connect (8k μ-law telephony) ---
     dg_params = {
@@ -335,7 +315,7 @@ async def enablex_stream(ws: WebSocket):
                                 logger.info("[ENX] start_media received")
                                 continue
 
-                            elif st == "recognized" and obj.get("text"):
+                            if st == "recognized" and obj.get("text"):
                                 if session and session.playing:
                                     with suppress(Exception):
                                         await enablex_stop_play(session.voice_id)
@@ -345,9 +325,6 @@ async def enablex_stream(ws: WebSocket):
                                 else:
                                     logger.warning("[ENX] recognized text but no voice_id; dropping")
                                 continue
-                            else:
-                                if st:
-                                    logger.info(f"[ENX] state={st} (no action)")
 
                             payload_b64 = (
                                 obj.get("payload")
@@ -364,7 +341,6 @@ async def enablex_stream(ws: WebSocket):
                                     if not audio_bytes:
                                         continue  # don't forward empties
                                     total_bytes += len(audio_bytes)
-                                    last_bytes += len(audio_bytes)
                                     if total_bytes % 32768 < 1600:
                                         logger.info(f"[ENX->DG] +{len(audio_bytes)}B (total {total_bytes}B)")
                                     await dg.send_bytes(audio_bytes)
@@ -385,7 +361,6 @@ async def enablex_stream(ws: WebSocket):
                                 continue
 
                             total_bytes += len(ulaw_bytes)
-                            last_bytes += len(ulaw_bytes)
                             if total_bytes % 32768 < 1600:
                                 logger.info(f"[ENX->DG] +{len(ulaw_bytes)}B (total {total_bytes}B)")
 
