@@ -137,7 +137,7 @@ async def serve_tts_ulaw(clip_id: str):
     data = AUDIO_STORE.get(clip_id)
     if not data:
         raise HTTPException(status_code=404, detail="Not found")
-
+    logger.info(f"[TTS SERVE] clip={clip_id} bytes={len(data)}")
     # Most telephony stacks expect 'audio/basic' for G.711 μ-law
     # Some use 'audio/ulaw' — if ENX complains, try that instead.
     return Response(
@@ -462,6 +462,12 @@ async def play_sentence(session: CallSession, text: str):
     await enablex_play_url(voice_id, url)
     session.playing = True
 
+def enx_auth_headers() -> dict:
+    return {
+        "X-App-ID": ENABLEX_APP_ID or "",
+        "X-App-Key": ENABLEX_APP_KEY or "",
+    }
+
 # -----------------------------
 # EnableX helpers (URL playback only — no built-in TTS)
 # -----------------------------
@@ -470,10 +476,12 @@ def enx_auth() -> BasicAuth:
         raise RuntimeError("Missing EnableX credentials")
     return BasicAuth(ENABLEX_APP_ID, ENABLEX_APP_KEY)
 
+
+
 async def enablex_start_media_stream(voice_id: str, stream_wss_url: str):
     url = f"{ENABLEX_BASE}/voice/v1/call/{voice_id}/stream"
     body = {"stream_dest": stream_wss_url}
-    async with aiohttp.ClientSession(auth=enx_auth()) as s:
+    async with aiohttp.ClientSession(auth=enx_auth(), headers=enx_auth_headers()) as s:
         r = await s.put(url, json=body)
         txt = await r.text()
         if r.status >= 400:
@@ -486,8 +494,11 @@ async def enablex_play_url(voice_id: str, media_url: str):
     body_candidates = [
         {"url": media_url},
         {"prompt_url": media_url},
+        # Some tenants use one of these shapes (try only if the two above 404):
+        # {"media_url": media_url},
+        # {"media": {"type": "audio", "url": media_url}},
     ]
-    async with aiohttp.ClientSession(auth=enx_auth()) as s:
+    async with aiohttp.ClientSession(auth=enx_auth(), headers=enx_auth_headers()) as s:
         for body in body_candidates:
             r = await s.put(url, json=body)
             txt = await r.text()
@@ -498,7 +509,7 @@ async def enablex_play_url(voice_id: str, media_url: str):
         logger.error("[ENX PLAY URL] All body variants failed; check tenant OpenAPI for the correct field.")
 
 async def enablex_stop_play(voice_id: str):
-    async with aiohttp.ClientSession(auth=enx_auth()) as s:
+    async with aiohttp.ClientSession(auth=enx_auth(), headers=enx_auth_headers()) as s:
         url1 = f"{ENABLEX_BASE}/voice/v1/call/{voice_id}/play/stop"
         r1 = await s.put(url1)
         if r1.status < 400:
