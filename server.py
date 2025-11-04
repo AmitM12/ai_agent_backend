@@ -332,11 +332,14 @@ async def enablex_stream(ws: WebSocket):
                                 or (obj.get("audio") or {}).get("data")
                                 or obj.get("data")
                             )
+
                             if payload_b64:
                                 try:
-                                    if dg_closing:
-                                        continue
+                                    if dg_closing or dg.closed:
+                                        return
                                     audio_bytes = base64.b64decode(payload_b64)
+                                    if not audio_bytes:
+                                        continue  # don't forward empties
                                     total_bytes += len(audio_bytes)
                                     if total_bytes % 32768 < 1600:
                                         logger.info(f"[ENX->DG] +{len(audio_bytes)}B (total {total_bytes}B)")
@@ -346,23 +349,27 @@ async def enablex_stream(ws: WebSocket):
                             continue
 
                         if ev.get("bytes") is not None:
-                            if dg_closing:
-                                continue
-                            # Binary frames: 12B header + base64 μ-law payload
+                            if dg_closing or dg.closed:
+                                return
                             buf = ev["bytes"]
-                            payload = buf[12:] if len(buf) > 12 else buf
-                            try:
-                                ulaw_bytes = base64.b64decode(payload, validate=False)
-                            except Exception:
-                                ulaw_bytes = payload
+
+                            # If your ENX binary framing has a 12-byte header, strip it; else just use buf as-is.
+                            ulaw_bytes = buf[12:] if len(buf) > 12 else buf
+
+                            # Skip empty frames
+                            if not ulaw_bytes:
+                                continue
+
                             total_bytes += len(ulaw_bytes)
                             if total_bytes % 32768 < 1600:
                                 logger.info(f"[ENX->DG] +{len(ulaw_bytes)}B (total {total_bytes}B)")
+
                             try:
                                 await dg.send_bytes(ulaw_bytes)
                             except Exception as e:
                                 logger.warning(f"[ENX->DG] send to Deepgram failed: {e}")
                             continue
+
                 finally:
                     with suppress(Exception):
                         await dg.close()
@@ -397,7 +404,6 @@ async def enablex_stream(ws: WebSocket):
 
                         elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
                             dg_closing = True
-                            # Surface close code/reason if available
                             try:
                                 logger.warning(f"[DG] closing: code={dg.close_code} reason={getattr(dg, 'close_message', None)}")
                             except Exception:
