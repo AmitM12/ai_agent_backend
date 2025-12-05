@@ -58,7 +58,7 @@ SYSTEM_PROMPT = system_prompt
 
 # Deepgram (Telephony ASR)
 DG_API_KEY = os.getenv("DG_API_KEY")
-ASR_ENDPOINTING_MS = int(os.getenv("ASR_ENDPOINTING_MS", "120"))  # silence timeout for finals
+ASR_ENDPOINTING_MS = int(os.getenv("ASR_ENDPOINTING_MS", "180"))  # silence timeout for finals
 ASR_LANGUAGE_HINT = (os.getenv("ASR_LANGUAGE_HINT") or "").strip()  # e.g., "en", "hi", "multi"
 
 # EnableX Voice API
@@ -70,7 +70,7 @@ ENABLEX_BASE = os.getenv("ENABLEX_BASE", "https://api.enablex.io")
 USE_ELEVENLABS_TTS = (os.getenv("USE_ELEVENLABS_TTS", "false").lower() in ("1","true","yes"))
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
-ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5")
 TTS_SENTENCE_MAX_CHARS = int(os.getenv("TTS_SENTENCE_MAX_CHARS", "120"))
 TTS_QUEUE_MAX = int(os.getenv("TTS_QUEUE_MAX", "12"))
 AUTO_GREETING = (os.getenv("AUTO_GREETING", "true").lower() in ("1","true","yes"))
@@ -136,6 +136,79 @@ SESSIONS: Dict[str, CallSession] = {}
 # -----------------------------
 # Utilities
 # -----------------------------
+
+async def analyze_comprehensive_lead_score(history: List[Dict[str, str]]) -> Dict:
+    """
+    Analyzes the call transcript and scores the lead on Engagement, Intent, Urgency, and Fit.
+    """
+    if not OPENAI_API_KEY:
+        return {"error": "No API Key"}
+
+    # 1. Convert history to a readable script
+    dialogue_text = ""
+    for turn in history:
+        role = "Agent" if turn["role"] == "assistant" else "Customer"
+        # Skip system instructions, only keep conversation
+        if turn["role"] == "system":
+            continue
+        dialogue_text += f"{role}: {turn['content']}\n"
+
+    # 2. Define the scoring criteria clearly
+    system_instruction = (
+        "You are a Senior Sales Analyst for an AI Voice Agent company. "
+        "Analyze the transcript below and score the potential customer on 4 dimensions. "
+        "For each dimension, assign a score of 'High', 'Medium', or 'Low' and provide a short reason.\n\n"
+
+        "1. ENGAGEMENT: Did the user talk back? Did they answer questions properly? "
+        "(High: Conversational, clear answers. Low: One-word replies, rude, disconnected early.)\n"
+        
+        "2. INTENT: Does the user want to buy/use the solution? "
+        "(High: Asking about price, implementation, or agreeing to a demo. Low: Just curious, browsing.)\n"
+        
+        "3. URGENCY: How soon do they need it? "
+        "(High: 'Need it now', 'ASAP', 'Problem is urgent'. Low: 'Just looking', 'Maybe next year'.)\n"
+        
+        "4. FIT: Does their business case match an AI Sales Agent? "
+        "(High: Auto dealerships, Real Estate, B2B Sales, High volume support. Low: Personal use, asking for unrelated services.)\n\n"
+        
+        "Output strictly valid JSON in this format:\n"
+        "{\n"
+        "  \"engagement\": { \"score\": \"...\", \"reason\": \"...\" },\n"
+        "  \"intent\": { \"score\": \"...\", \"reason\": \"...\" },\n"
+        "  \"urgency\": { \"score\": \"...\", \"reason\": \"...\" },\n"
+        "  \"fit\": { \"score\": \"...\", \"reason\": \"...\" }\n"
+        "}"
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": "gpt-4o-mini", # or "gpt-3.5-turbo-0125" - needs to be JSON capable
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": f"Transcript:\n{dialogue_text}"}
+                ],
+                "temperature": 0.0, # Low temp for consistent, logical analysis
+                "response_format": {"type": "json_object"}
+            }
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            async with session.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.error(f"[SCORE] API Error: {await resp.text()}")
+                    return {"error": "API Error"}
+                
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                return json.loads(content)
+
+    except Exception as e:
+        logger.exception("[SCORE] Analysis failed")
+        return {"error": str(e)}
+
 END_PUNCT = ("!", "?", ".", "।")
 
 async def wait_for_stream_id(session: CallSession, timeout: float = 2.0):
@@ -190,21 +263,16 @@ def _is_simple_greeting(text: str) -> bool:
 #         return "Sorry, I’m having trouble right now—please try again."
 #     return (data["choices"][0]["message"]["content"] or "").strip()
 
-async def llm_reply_with_history(session: CallSession, user_text: str) -> str:
+async def llm_reply_with_history(session: CallSession, user_text: str):
     """
-    Streaming LLM call using the shared app.state.http ClientSession.
-
-    - Sends full chat history (trimmed) with `stream: True`.
-    - Reads "data: {...}" SSE lines as they arrive.
-    - Logs:
-        * LLM ttfb_ms  -> time to first token
-        * LLM latency_ms -> time until full answer is done
-    - Returns the full concatenated reply text (for now we still TTS once at the end).
+    Revised to be an ASYNC GENERATOR. 
+    It yields small chunks of text as they arrive from OpenAI.
     """
     if not OPENAI_API_KEY:
-        return "Sorry, I’m having trouble right now—please try again."
+        yield "Sorry, I’m having trouble right now—please try again."
+        return
 
-    # 1) Build messages for this turn (system + prior history)
+    # 1) Build messages
     messages = _trim_history_for_budget(session.history, max_chars=8000)
 
     url = "https://api.openai.com/v1/chat/completions"
@@ -216,133 +284,53 @@ async def llm_reply_with_history(session: CallSession, user_text: str) -> str:
         "model": OPENAI_CHAT_MODEL,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": 48,
-        "stream": True,  # streaming mode
+        "max_tokens": 150, # Increased slightly to allow for fuller answers
+        "stream": True,
     }
-
-    # We'll collect all text pieces here
-    chunks: List[str] = []
 
     # Timing
     session.llm_start_ts = time.perf_counter()
     first_chunk_ts: Optional[float] = None
-
-    # 2) Get the shared HTTP session from app.state.http
+    
+    # Get shared http session
     http: Optional[ClientSession] = getattr(getattr(app, "state", None), "http", None)
-
-    # Fallback: if for some reason startup hasn't created it (e.g. in unit tests),
-    # create a local temporary session and close it at the end.
     created_here = False
     if http is None:
         http = aiohttp.ClientSession(timeout=ClientTimeout(total=0))
         created_here = True
 
     try:
-        # 3) Open the streaming request using the shared session
         async with http.post(url, json=body, headers=headers) as resp:
             resp.raise_for_status()
 
-            # Read raw bytes lines as they arrive
             async for raw_line in resp.content:
-                if not raw_line:
-                    continue
-
+                if not raw_line: continue
                 line = raw_line.strip()
-                if not line:
-                    continue
-
-                # OpenAI SSE format: lines starting with "data: "
-                if not line.startswith(b"data:"):
-                    # Could be comments/heartbeats, ignore
-                    continue
+                if not line or not line.startswith(b"data:"): continue
 
                 data_bytes = line[len(b"data:"):].strip()
+                if data_bytes == b"[DONE]": break
 
-                # End-of-stream marker
-                if data_bytes == b"[DONE]":
-                    break
-
-                # Parse JSON chunk
                 try:
                     payload = json.loads(data_bytes.decode("utf-8"))
+                    piece = payload["choices"][0]["delta"].get("content")
+                    if piece:
+                        # Log TTFB on first token
+                        if first_chunk_ts is None:
+                            first_chunk_ts = time.perf_counter()
+                            ttfb_ms = (first_chunk_ts - session.llm_start_ts) * 1000.0
+                            logger.info(f"[METRIC] LLM ttfb_ms={ttfb_ms:.1f}")
+                        
+                        # YIELD the piece immediately to the caller
+                        yield piece
                 except Exception:
                     continue
-
-                choices = payload.get("choices") or []
-                if not choices:
-                    continue
-
-                delta = choices[0].get("delta") or {}
-                piece = delta.get("content")
-                if not piece:
-                    continue
-
-                # Append piece to our growing text
-                chunks.append(piece)
-
-                # First token -> log TTFB
-                if first_chunk_ts is None:
-                    first_chunk_ts = time.perf_counter()
-                    ttfb_ms = (first_chunk_ts - session.llm_start_ts) * 1000.0
-                    logger.info(
-                        "[METRIC] LLM ttfb_ms=%.1f turn=%d user_text=%r",
-                        ttfb_ms,
-                        session.turn,
-                        user_text,
-                    )
-
-        # 4) Stream finished: compute total LLM latency
-        session.llm_end_ts = time.perf_counter()
-        llm_ms = (session.llm_end_ts - session.llm_start_ts) * 1000.0
-
-        reply_text = "".join(chunks).strip()
-        if not reply_text:
-            reply_text = "Sorry, I’m having trouble right now—please try again."
-
-        logger.info(
-            "[METRIC] LLM latency_ms=%.1f turn=%d user_text=%r",
-            llm_ms,
-            session.turn,
-            user_text,
-        )
-
-        return reply_text
-
-    except Exception:
-        # If streaming fails, fall back to the old non-streaming helper
-        logger.exception("[LLM] streaming failed, falling back to non-streaming call")
-
-        body_fallback = {
-            "model": OPENAI_CHAT_MODEL,
-            "messages": messages,
-            "temperature": 0.3,
-            "max_tokens": 48,
-        }
-
-        session.llm_start_ts = time.perf_counter()
-        data = await _openai_with_retries(url, body_fallback, headers, attempts=3)
-        session.llm_end_ts = time.perf_counter()
-        llm_ms = (session.llm_end_ts - session.llm_start_ts) * 1000.0
-
-        if data.get("_error"):
-            logger.error(f"[LLM] OpenAI error after retries (fallback): {data}")
-            return "Sorry, I’m having trouble right now—please try again."
-
-        logger.info(
-            "[METRIC] LLM latency_ms=%.1f turn=%d user_text=%r",
-            llm_ms,
-            session.turn,
-            user_text,
-        )
-
-        return (data["choices"][0]["message"]["content"] or "").strip()
-
+    except Exception as e:
+        logger.error(f"[LLM] Stream failed: {e}")
+        yield "Sorry, I am having trouble connecting."
     finally:
-        # Only close the HTTP session if we created a temporary one here
         if created_here:
-            with suppress(Exception):
-                await http.close()
-
+            await http.close()
 
 def jd(x) -> str:
     return json.dumps(x, ensure_ascii=False, separators=(",", ":"))
@@ -369,17 +357,39 @@ async def ensure_session(voice_id: str) -> CallSession:
         SESSIONS[voice_id] = CallSession(voice_id)
     return SESSIONS[voice_id]
 
-def _print_session_history(session: CallSession):
-    # Skip the system message; print only user/assistant turns
+def _print_session_history(session: CallSession, scores: Optional[Dict] = None):
+    # 1. Format the Dialogue
     lines = []
     for m in session.history:
         if m["role"] == "system":
             continue
         who = "USER" if m["role"] == "user" else "BOT "
         lines.append(f"{who}: {m['content']}")
-    log = "\n".join(lines) if lines else "(no dialogue)"
-    logger.info("\n====== DIALOGUE (voice_id=%s, turns=%d) ======\n%s\n================== END ==================\n",
-                session.voice_id, session.turn, log)
+    dialogue_text = "\n".join(lines) if lines else "(no dialogue)"
+
+    # 2. Build the Main Log String
+    log_output = (
+        f"\n====== DIALOGUE (voice_id={session.voice_id}, turns={session.turn}) ======\n"
+        f"{dialogue_text}\n"
+        f"================== END =================="
+    )
+
+    # 3. Append Scores if they exist
+    if scores and "error" not in scores:
+        score_section = (
+            f"\n\n====== LEAD METRICS ======\n"
+            f"ENGAGEMENT: [{scores.get('engagement', {}).get('score', 'N/A')}] - {scores.get('engagement', {}).get('reason', '')}\n"
+            f"INTENT:     [{scores.get('intent', {}).get('score', 'N/A')}] - {scores.get('intent', {}).get('reason', '')}\n"
+            f"URGENCY:    [{scores.get('urgency', {}).get('score', 'N/A')}] - {scores.get('urgency', {}).get('reason', '')}\n"
+            f"FIT:        [{scores.get('fit', {}).get('score', 'N/A')}] - {scores.get('fit', {}).get('reason', '')}\n"
+            f"=========================="
+        )
+        log_output += score_section
+    elif scores and "error" in scores:
+        log_output += f"\n\n[SCORE ERROR]: {scores['error']}"
+
+    # 4. Print it all at once
+    logger.info(log_output)
 
 # -----------------------------
 # Health & Config check
@@ -411,8 +421,8 @@ async def _http_pool():
 
     # Optional: pre-generate ULaw for very common phrases
     greeting_text = (
-        "Hello, mai Raj bol raha hu, ABC Motors se. "
-        "Kya mai John se baat kar raha hu?"
+        "Hello John, mai Raj bol raha hu, from the House of Mantaray."
+        "Is this a good time to talk?"
     )
     if ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID:
         try:
@@ -487,8 +497,18 @@ async def enablex_webhook(req: Request):
     
     end_states = {"completed", "disconnected", "hangup", "ended", "failed", "terminated"}
     if state in end_states:
-        _print_session_history(session)
-        # Optional: free memory after printing
+        scores = None
+
+        # 1. Calculate scores FIRST (Wait for it)
+        if len(session.history) > 2:
+            logger.info("[SCORE] Analyzing detailed lead metrics before printing logs...")
+            # This await ensures we have the data before we print the history
+            scores = await analyze_comprehensive_lead_score(session.history)
+
+        # 2. Print Dialogue AND Scores together
+        _print_session_history(session, scores)
+
+        # 3. Cleanup
         with suppress(Exception):
             SESSIONS.pop(session.voice_id, None)
         return {"ok": True}
@@ -572,6 +592,7 @@ async def enablex_stream(ws: WebSocket):
         "endpointing": str(ASR_ENDPOINTING_MS),
         # Optionally add "language": "en" or "hi" if you really need a fixed language.
         # Avoid "multi" unless your DG account/docs confirm it for nova-3 Listen.
+        "utterance_end_ms": "1000",  # how long of silence to consider end of utterance
     }
 
     if ASR_LANGUAGE_HINT:
@@ -746,14 +767,34 @@ async def enablex_stream(ws: WebSocket):
 
                 finally:
                     try:
-                        _print_session_history(session)
+                        # ---------------------------------------------------------
+                        # CHANGED: Calculate Score HERE, inside the socket cleanup
+                        # ---------------------------------------------------------
+                        scores = None
+                        
+                        # Only analyze if we had a real conversation (more than 2 turns)
+                        if len(session.history) > 2:
+                            logger.info("[SCORE] Analyzing detailed lead metrics...")
+                            try:
+                                # We await the analysis so the log doesn't print until we have the data
+                                scores = await analyze_comprehensive_lead_score(session.history)
+                            except Exception as e:
+                                logger.error(f"[SCORE] Failed to generate score: {e}")
+                                scores = {"error": str(e)}
+
+                        # Print everything together
+                        _print_session_history(session, scores)
+
+                    except Exception as e:
+                        logger.error(f"Error in session cleanup: {e}")
                     finally:
+                        # Delete the session from memory
                         with suppress(Exception):
                             SESSIONS.pop(session.voice_id, None)
-                    if session:
-                        session.ws = None
-                    with suppress(Exception):
-                        await dg.close()
+                        if session:
+                            session.ws = None
+                        with suppress(Exception):
+                            await dg.close()
 
             async def pump_dg_to_bot():
                 nonlocal dg_closing
@@ -765,52 +806,66 @@ async def enablex_stream(ws: WebSocket):
                             except Exception:
                                 continue
 
-                            # Log server-side issues early
                             t = evt.get("type")
-                            if t in ("Warning", "Error"):
-                                logger.warning(f"[DG] {t}: {evt}")
-                            if t == "Metadata":
-                                logger.info(f"[DG] metadata: {evt.get('request_id')}")
+                            
                             if t == "Results":
-                                alt0 = (evt.get("channel", {}).get("alternatives") or [{}])[0]
+                                channel = evt.get("channel", {})
+                                alternatives = channel.get("alternatives") or []
+                                if not alternatives:
+                                    continue
+                                
+                                alt0 = alternatives[0]
                                 transcript = alt0.get("transcript") or ""
                                 is_final = bool(evt.get("is_final") or evt.get("speech_final"))
-                                if transcript:
-                                    logger.info(f"[ASR]{' (final)' if is_final else ''}: {transcript}")
-                                if transcript and is_final and session:
+
+                                # ---------------------------------------------------------
+                                # NEW: IMMEDIATE BARGE-IN LOGIC
+                                # If we hear ANYTHING (even interim), and we are playing, STOP.
+                                # ---------------------------------------------------------
+                                if transcript and session.playing:
+                                    logger.info(f"[BARGE-IN] detected speech: '{transcript}' -> Stopping playback.")
+                                    
+                                    # 1. Stop EnableX Audio
+                                    await enablex_stop_play(session)
+                                    
+                                    # 2. Update Local State
+                                    session.playing = False
+                                    
+                                    # 3. CRITICAL: Clear the TTS queue so it doesn't resume 
+                                    #    speaking the *next* sentence of the old reply.
+                                    session.tts_queue.clear()
+                                    
+                                    # 4. Increment gen_id to invalidate any TTS chunks currently processing
+                                    session.gen_id += 1
+
+                                # ---------------------------------------------------------
+                                # EXISTING: LLM PROCESSING LOGIC
+                                # Only send to Brain (LLM) when we have the Full Thought
+                                # ---------------------------------------------------------
+                                if transcript and is_final:
                                     t = transcript.strip()
                                     if t == session.last_final:
                                         logger.info("[ASR] duplicate final ignored")
                                         continue
                                     session.last_final = t
 
-                                    # --- LATENCY: ASR endpointing + decode ---
+                                    # Log metrics
                                     now = time.perf_counter()
                                     if session.asr_last_audio_ts:
                                         asr_latency_ms = (now - session.asr_last_audio_ts) * 1000.0
-                                        logger.info(
-                                            "[METRIC] ASR endpoint+decode latency_ms=%.1f text=%r",
-                                            asr_latency_ms,
-                                            t,
-                                        )
+                                        logger.info(f"[METRIC] ASR latency_ms={asr_latency_ms:.1f} text='{t}'")
                                     session.asr_last_final_ts = now
 
-                                    if session.playing:
-                                        with suppress(Exception): await enablex_stop_play(session)
-                                        session.playing = False
+                                    # Send to LLM
                                     asyncio.create_task(handle_final_text(session, t))
 
-                        elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
+                        elif m.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
                             dg_closing = True
-                            try:
-                                logger.warning(f"[DG] closing: code={dg.close_code} reason={getattr(dg, 'close_message', None)}")
-                            except Exception:
-                                logger.warning("[DG] closing")
                             break
                 except Exception as e:
+                    logger.error(f"[DG] reader error: {e}")
                     dg_closing = True
-                    logger.warning(f"[DG] reader error: {e}")
-
+            
             await asyncio.gather(pump_enx_to_dg(), pump_dg_to_bot())
             with suppress(Exception):
                 ka_task.cancel()
@@ -829,60 +884,89 @@ async def enablex_stream_alias(ws: WebSocket):
 # Core bot logic: Echo or LLM → TTS → EnableX play
 # -----------------------------
 async def handle_final_text(session: CallSession, user_text: str):
-    logger.info(f"[BOT] handle_final_text (echo_mode={ECHO_MODE}): {user_text}")
+    logger.info(f"[BOT] handle_final_text: {user_text}")
     session.turn += 1
 
-    # add user turn in memory
+    # 1. Update history with User input
     session.history.append({"role": "user", "content": user_text})
-    # cap size: keep system + latest ~49 msgs
     if len(session.history) > 50:
-        system = session.history[0]
-        session.history = [system] + session.history[-49:]
+        session.history = [session.history[0]] + session.history[-49:]
 
-    # choose reply
-    if ECHO_MODE:
-        reply_text = user_text
-    # Fast path: first real user turn and simple greeting → no LLM
-    elif session.turn == 1 and _is_simple_greeting(user_text):
-        reply_text = (
-            "Hello, mai Raj bol raha hu, ABC Motors se. "
-            "Kya mai John se baat kar raha hu?"
-        )
-
-    else:
-        # streaming llm call with history and latency metrics
-        reply_text = await llm_reply_with_history(session, user_text)
-    
-    if DEBUG_VOICE:
-        logger.info(
-            "[DEBUG VOICE] LLM reply turn=%d raw=%r",
-            session.turn,
-            reply_text,
-        )
-
-    # add assistant turn in memory
-    session.history.append({"role": "assistant", "content": reply_text})
-
-    # IMPORTANT: bump gen ONCE for this turn
+    # 2. Reset playback state
     session.gen_id += 1
-    my_gen = session.gen_id
+    current_gen = session.gen_id
 
-    if DEBUG_VOICE:
-        logger.info(
-            "[DEBUG VOICE] handle_final_text gen=%d user=%r",
-            my_gen,
-            user_text,
-        )
+    # Echo Mode (No change here)
+    if ECHO_MODE:
+        session.history.append({"role": "assistant", "content": user_text})
+        enqueue_reply(session, user_text, current_gen)
+        return
 
-    # enqueue instead of speaking inline
-    enqueue_reply(session, reply_text, my_gen)
+    # Fast Path: Simple Greetings (No change here)
+    if session.turn == 1 and _is_simple_greeting(user_text):
+        reply_text = "Hello John, mai Raj bol raha hu, from the House of Mantaray. Is this a good time to talk?"
+        session.history.append({"role": "assistant", "content": reply_text})
+        enqueue_reply(session, reply_text, current_gen)
+        return
 
-    # for s in segs:
-    #     if not (ECHO_MODE and ECHO_STRICT_NO_SPLIT):
-    #         if len(s) > TTS_SENTENCE_MAX_CHARS:
-    #             s = s[:TTS_SENTENCE_MAX_CHARS] + "…"
-    #     await play_sentence(session, s)
+    # 3. STREAMING LOGIC (The New Part)
+    full_bot_response = ""
+    buffer = ""
+    
+    # We define what looks like the end of a sentence
+    # Note: Added Hindi punctuation '।'
+    sentence_endings = {'.', '?', '!', '。', '।', '\n'}
 
+    try:
+        # Loop over the stream generator we created in Step 1
+        async for chunk in llm_reply_with_history(session, user_text):
+            # If user interrupted (new gen_id), stop processing this stream
+            if session.gen_id != current_gen:
+                logger.info("[BOT] Interrupted by new user input")
+                return
+
+            buffer += chunk
+            full_bot_response += chunk
+
+            # Check if we have a complete sentence in the buffer
+            # We look for punctuation followed by space or end of string
+            while True:
+                # Find the earliest punctuation mark
+                earliest_idx = -1
+                for punct in sentence_endings:
+                    idx = buffer.find(punct)
+                    if idx != -1:
+                        if earliest_idx == -1 or idx < earliest_idx:
+                            earliest_idx = idx
+                
+                # If no punctuation found, break and wait for more chunks
+                if earliest_idx == -1:
+                    break
+                
+                # We found a sentence! Extract it.
+                # +1 to include the punctuation itself
+                split_point = earliest_idx + 1
+                sentence = buffer[:split_point].strip()
+                buffer = buffer[split_point:] # Keep the rest in buffer
+
+                if sentence:
+                    # Send this sentence to TTS immediately
+                    enqueue_reply(session, sentence, current_gen)
+
+        # 4. Stream finished: Handle any leftover text in the buffer
+        if buffer.strip() and session.gen_id == current_gen:
+            enqueue_reply(session, buffer.strip(), current_gen)
+
+        # 5. Finally, save the FULL response to history for context
+        session.history.append({"role": "assistant", "content": full_bot_response})
+        
+        session.llm_end_ts = time.perf_counter()
+        total_latency = (session.llm_end_ts - session.llm_start_ts) * 1000
+        logger.info(f"[METRIC] Total LLM Stream finished. Latency: {total_latency:.1f}ms")
+
+    except Exception as e:
+        logger.exception("[BOT] Error in streaming handler")
+        enqueue_reply(session, "Sorry, I didn't catch that.", current_gen)
 
 async def _openai_with_retries(url: str, body: dict, headers: dict, attempts: int = 3) -> dict:
     delay = 0.5
@@ -928,12 +1012,12 @@ async def llm_reply(user_text: str) -> str:
         data = await _openai_with_retries(url, body, headers, attempts=3)
         if data.get("_error"):
             logger.error(f"[LLM] OpenAI error after retries: {data}")
-            return "Sorry, I’m having trouble right now—please try again."  # single sentence (no split)
+            return "Sorry, I’m having trouble right now, please try again."  # single sentence (no split)
         return (data["choices"][0]["message"]["content"] or "").strip()
     except Exception:
         logger.exception("[LLM] OpenAI chat completion failed")
         # Keep it to a **single sentence** so segmentation doesn’t create two plays
-        return "Sorry, I’m having trouble right now—please try again."
+        return "Sorry, I’m having trouble right now, please try again."
     
 # -----------------------------
 # TTS queue and speaker loop
@@ -989,7 +1073,7 @@ def enqueue_reply(
     if not text:
         return
 
-    # Still keep a safety cap on very long replies
+    # ✅ HARD CAP FOR SPEED
     if len(text) > TTS_SENTENCE_MAX_CHARS:
         text = text[:TTS_SENTENCE_MAX_CHARS] + "…"
 
@@ -1008,15 +1092,15 @@ def _ulaw_duration_sec(clip_id: str) -> float:
 async def _wait_until_done(session: CallSession, est_sec: float, my_gen: int):
     """
     Wait until playback should be finished, unless a new gen invalidates us (barge-in/new turn).
-    Poll in small steps so we yield to the event loop.
+    Less conservative to reduce perceived latency.
     """
-    # A small safety buffer to account for network jitter / player start-up
-    target = asyncio.get_event_loop().time() + est_sec + 0.10
-    while asyncio.get_event_loop().time() < target:
-        # If a newer utterance started, abort waiting
+    loop = asyncio.get_event_loop()
+    # was +0.10 and sleep 0.05 → be slightly more aggressive
+    target = loop.time() + est_sec + 0.05
+    while loop.time() < target:
         if my_gen != session.gen_id:
             return
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.03)
     session.playing = False
 
 
@@ -1521,11 +1605,15 @@ async def elevenlabs_synth_to_url(text: str) -> Tuple[str, str]:
         raise RuntimeError("Missing ElevenLabs config")
 
     api_url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream"
-    params = {"optimize_streaming_latency": "3", "output_format": "mp3_22050_32"}
+    params = {"optimize_streaming_latency": "2", "output_format": "mp3_22050_32"}
     body = {
         "text": text,
         "model_id": ELEVENLABS_MODEL_ID,
-        "voice_settings": {"stability": 0.8, "similarity_boost": 0.7, "style": 0.65, "use_speaker_boost": True}
+        "voice_settings": {
+            "stability": 0.45, 
+            "similarity_boost": 0.8, 
+            "style": 0.00,
+            "use_speaker_boost": True}
     }
     headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
 
