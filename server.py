@@ -110,6 +110,8 @@ class CallSession:
         self.stream_id: Optional[str] = None # from start_media event
         self.out_seq: int = 0                # sequence for media we send
 
+        self.lead_id: Optional[str] = None
+
         # NEW: purely in-memory dialogue
         self.turn: int = 0
         self.history: List[Dict[str, str]] = [
@@ -136,6 +138,155 @@ SESSIONS: Dict[str, CallSession] = {}
 # -----------------------------
 # Utilities
 # -----------------------------
+
+def build_timeline_history(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Convert OpenAI-style history into List[{Question, Lead}].
+
+    - "Question" = assistant (bot) text
+    - "Lead"     = user text
+    - We pair the latest bot message with the next user message.
+    """
+    timeline: List[Dict[str, str]] = []
+    last_bot: Optional[str] = None
+
+    for msg in history:
+        role = msg.get("role")
+        content = (msg.get("content") or "").strip()
+        if role == "system" or not content:
+            continue
+
+        if role == "assistant":
+            # If bot speaks multiple times before user replies, join them
+            if last_bot is None:
+                last_bot = content
+            else:
+                last_bot += " " + content
+
+        elif role == "user":
+            if last_bot is None:
+                # user spoke first
+                timeline.append({"Question": "", "Lead": content})
+            else:
+                timeline.append({"Question": last_bot, "Lead": content})
+                last_bot = None
+
+    # If bot spoke last and user never replied
+    if last_bot:
+        timeline.append({"Question": last_bot, "Lead": ""})
+
+    return timeline
+
+def map_score_block(block: Optional[Dict]) -> Dict[str, str]:
+    """
+    Convert {'score': 'High', 'reason': '...'}
+    → {'level': 'High', 'reason': '...'}
+    """
+    if not isinstance(block, dict):
+        return {"level": "", "reason": ""}
+
+    return {
+        "level": block.get("score", "") or "",
+        "reason": block.get("reason", "") or "",
+    }
+
+def classify_lead(scores: Optional[Dict]) -> str:
+    """
+    Very simple rule-of-thumb classification:
+        - 3 or 4 'High'  → 'Hot'
+        - 2 'High'       → 'Warm'
+        - else           → 'Cold'
+    """
+    if not scores or "error" in scores:
+        return ""
+
+    dims = ["engagement", "intent", "urgency", "fit"]
+    high_count = 0
+    for d in dims:
+        v = (scores.get(d) or {}).get("score", "").lower()
+        if v == "high":
+            high_count += 1
+
+    if high_count >= 3:
+        return "Hot"
+    if high_count >= 2:
+        return "Warm"
+    return "Cold"
+
+def build_lead_update_payload(
+    session: CallSession,
+    scores: Optional[Dict]
+) -> Dict:
+    """
+    Build the JSON body to send to your CRM API.
+    Only filling fields you asked for + some sensible defaults.
+    """
+    engagement_block = {}
+    intent_block = {}
+    urgency_block = {}
+    fit_block = {}
+
+    if scores and "error" not in scores:
+        engagement_block = map_score_block(scores.get("engagement"))
+        intent_block     = map_score_block(scores.get("intent"))
+        urgency_block    = map_score_block(scores.get("urgency"))
+        fit_block        = map_score_block(scores.get("fit"))
+
+    timeline = build_timeline_history(session.history)
+    lead_classification = classify_lead(scores)
+
+    body = {
+        # Static or semi-static fields you can tweak
+        "Status": "Connected",
+        "Remark": "Updated automatically by AI.",
+        "LeadClassification": lead_classification,  # "Hot"/"Warm"/"Cold" or ""
+
+        "Engagement": engagement_block,
+        "Intent": intent_block,
+        "Urgency": urgency_block,
+        "Fit": fit_block,
+        "TimeLineHistory": timeline,
+    }
+
+    # Later, if you have name/phone/etc in session.extra,
+    # you can add them here: body["LeadName"] = session.extra.get("LeadName", "")
+
+    return body
+
+async def push_lead_update_to_crm(session: CallSession, scores: Optional[Dict]):
+    """
+    Send Engagement/Intent/Urgency/Fit + TimelineHistory
+    to https://aiagentapi.adlrealtors.com/api/client/UpdateLeadByAi/:id
+    """
+    if not session.lead_id:
+        logger.warning("[LEAD API] No lead_id on session; skipping CRM update")
+        return
+
+    base_url = "https://aiagentapi.adlrealtors.com/api/client/UpdateLeadByAi"
+    url = f"{base_url}/{session.lead_id}"
+
+    body = build_lead_update_payload(session, scores)
+    logger.info(f"[LEAD API] PUT {url} body={jd(body)}")
+
+    http: Optional[ClientSession] = getattr(getattr(app, "state", None), "http", None)
+    created_here = False
+    if http is None:
+        http = aiohttp.ClientSession(timeout=ClientTimeout(total=10))
+        created_here = True
+
+    try:
+        async with http.put(url, json=body) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                logger.error(f"[LEAD API] {resp.status} {text}")
+            else:
+                logger.info(f"[LEAD API] SUCCESS {resp.status} {text}")
+    except Exception:
+        logger.exception("[LEAD API] failed to update lead")
+    finally:
+        if created_here:
+            await http.close()
+
 
 async def analyze_comprehensive_lead_score(history: List[Dict[str, str]]) -> Dict:
     """
@@ -485,6 +636,12 @@ async def enablex_webhook(req: Request):
 
     session = await ensure_session(voice_id)
 
+    lead_id = payload.get("lead_id") or payload.get("LeadId") or payload.get("id")
+    if lead_id:
+        session.lead_id = str(lead_id)
+        logger.info(f"[LEAD] attached lead_id={session.lead_id} to voice_id={session.voice_id}")
+
+
     # When call is answered/connected: start media stream to our WS endpoint
     if state in ("answered", "connected", "live"):
         wss_url = f"{PUBLIC_BASE_URL.replace('http','ws').replace('https','wss')}/enablex/stream?voice_id={voice_id}"
@@ -497,20 +654,7 @@ async def enablex_webhook(req: Request):
     
     end_states = {"completed", "disconnected", "hangup", "ended", "failed", "terminated"}
     if state in end_states:
-        scores = None
-
-        # 1. Calculate scores FIRST (Wait for it)
-        if len(session.history) > 2:
-            logger.info("[SCORE] Analyzing detailed lead metrics before printing logs...")
-            # This await ensures we have the data before we print the history
-            scores = await analyze_comprehensive_lead_score(session.history)
-
-        # 2. Print Dialogue AND Scores together
-        _print_session_history(session, scores)
-
-        # 3. Cleanup
-        with suppress(Exception):
-            SESSIONS.pop(session.voice_id, None)
+        logger.info(f"[ENX EVT] call {voice_id} ended with state={state}; WS cleanup will handle metrics + CRM.")
         return {"ok": True}
     
     # EnableX-recognized webhook shape
@@ -577,6 +721,13 @@ async def enablex_stream(ws: WebSocket):
 
     session = await ensure_session(voice_id)
     session.ws = ws # bind for downlink use
+
+    # NEW: capture lead_id from query string / headers
+    lead_id = params.get("lead_id") or hdrs.get("x-lead-id") or hdrs.get("x-lead_id")
+    if lead_id:
+        session.lead_id = str(lead_id)
+        logger.info(f"[LEAD] attached lead_id={session.lead_id} to session voice_id={voice_id}")
+
     logger.info(f"[ENX WS] connected path={ws.url.path} voice_id={voice_id}")
 
     from urllib.parse import quote_plus
@@ -784,6 +935,11 @@ async def enablex_stream(ws: WebSocket):
 
                         # Print everything together
                         _print_session_history(session, scores)
+
+                        # 2) NEW: Push to your CRM (same place)
+                        with suppress(Exception):
+                            await push_lead_update_to_crm(session, scores)
+
 
                     except Exception as e:
                         logger.error(f"Error in session cleanup: {e}")
